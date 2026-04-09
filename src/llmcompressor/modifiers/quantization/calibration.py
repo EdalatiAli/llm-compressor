@@ -33,6 +33,27 @@ __all__ = [
 ]
 
 
+def _resolve_quantization_args(module: Module, base_name: str) -> QuantizationArgs:
+    """
+    Resolve the QuantizationArgs for a given base_name. For "q", checks
+    for a per-query override stored as ``_q_quantization_args`` on the module
+    before falling back to the scheme's ``input_activations``.
+    """
+    if base_name == "q":
+        override = getattr(module, "_q_quantization_args", None)
+        if override is not None:
+            return override
+
+    if base_name == "weight":
+        arg_name = "weights"
+    elif base_name == "output":
+        arg_name = "output_activations"
+    else:  # input, q, k, v
+        arg_name = "input_activations"
+
+    return getattr_chain(module, f"quantization_scheme.{arg_name}", None)
+
+
 def initialize_observer(
     module: Module,
     base_name: str,
@@ -49,16 +70,7 @@ def initialize_observer(
     :param base_name: str used to name the observer attribute
 
     """
-    if base_name == "weight":
-        arg_name = "weights"
-    elif base_name == "output":
-        arg_name = "output_activations"
-    else:  # input, q, k, v
-        arg_name = "input_activations"
-
-    args: QuantizationArgs = getattr_chain(
-        module, f"quantization_scheme.{arg_name}", None
-    )
+    args: QuantizationArgs = _resolve_quantization_args(module, base_name)
     observer = args.observer
 
     # training is no longer supported: always use memoryless for weights
@@ -172,9 +184,7 @@ def calibrate_activations(module: Module, value: torch.Tensor, base_name: str):
     if value.numel() == 0:
         return
 
-    field_name = "input" if base_name != "output" else "output"  # input,q,k,v,output
-    args_attr = f"quantization_scheme.{field_name}_activations"
-    quantization_args = getattr_chain(module, args_attr, None)
+    quantization_args = _resolve_quantization_args(module, base_name)
 
     calculate_qparams = True
     calculate_gparam = False

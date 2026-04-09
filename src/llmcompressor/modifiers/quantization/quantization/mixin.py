@@ -4,6 +4,7 @@ import torch
 from compressed_tensors.modeling import (
     IMPL_ATTR,
     KV_CACHE_ATTR,
+    initialize_hooked_attention,
 )
 from compressed_tensors.offload.dist_utils import is_distributed
 from compressed_tensors.quantization import (
@@ -19,6 +20,7 @@ from compressed_tensors.quantization import (
     is_preset_scheme,
     preset_name_to_scheme,
 )
+from compressed_tensors.quantization.lifecycle.initialize import initialize_qparams
 from compressed_tensors.quantization.utils import KV_CACHE_TARGETS
 from compressed_tensors.utils import match_named_modules, update_offload_parameter
 from pydantic import Field, PrivateAttr, field_validator
@@ -116,6 +118,10 @@ class QuantizationMixin(HooksMixin):
     :param bypass_divisibility_checks: if True, skip the check that weight columns
         are divisible by group_size for GROUP/TENSOR_GROUP. Use when your runtime
         (e.g. vLLM) supports non-divisible dimensions. Defaults to False.
+    :param q_scheme: optional QuantizationArgs for query-state quantization,
+        independent of kv_cache_scheme. When set alongside kv_cache_scheme,
+        allows calibrating q with different args (e.g. per-tensor FP8) than
+        k/v (e.g. NVFP4 global scale). Requires kv_cache_scheme to also be set.
     """
 
     config_groups: Optional[Dict[str, QuantizationScheme]] = None
@@ -126,6 +132,7 @@ class QuantizationMixin(HooksMixin):
     ignore: List[str] = Field(default_factory=list)
     scheme: Optional[Union[str, Dict[str, Any]]] = None
     kv_cache_scheme: Optional[QuantizationArgs] = None
+    q_scheme: Optional[QuantizationArgs] = None
     # Observer parameters for easy specification
     weight_observer: Optional[str] = None
     input_observer: Optional[str] = None
@@ -225,6 +232,9 @@ class QuantizationMixin(HooksMixin):
             reset_quantization_status(module)  # reset any previously applied qconfigs
 
         apply_quantization_config(model, self.resolved_config)
+
+        if self.q_scheme is not None:
+            self._apply_q_scheme(model)
 
         if not self.bypass_divisibility_checks:
             validate_group_size_divisibility(model, self.resolved_targets, self.ignore)
@@ -420,6 +430,45 @@ class QuantizationMixin(HooksMixin):
 
         return scheme
 
+    def _apply_q_scheme(self, model: torch.nn.Module):
+        """
+        Attach IMPL_ATTR and initialize q quantization parameters on attention
+        modules using ``self.q_scheme``, independent of kv_cache_scheme.
+        """
+        from compressed_tensors.utils import get_head_dim, get_num_attn_heads
+
+        for module in model.modules():
+            if not is_attention_module(module):
+                continue
+
+            initialize_hooked_attention(model, module)
+
+            kv_cache = getattr(module, KV_CACHE_ATTR, None)
+            if kv_cache is None:
+                continue
+
+            config = kv_cache.config
+            num_attn_heads = get_num_attn_heads(config)
+            head_dim = get_head_dim(config)
+            q_observed_shape = (num_attn_heads, None, head_dim)
+            observed_dtype = next(module.parameters()).dtype
+
+            initialize_qparams(
+                module,
+                "q",
+                self.q_scheme,
+                observed_shape=q_observed_shape,
+                observed_dtype=observed_dtype,
+                force_zero_point=False,
+            )
+
+            module._q_quantization_args = self.q_scheme
+
+    def _q_needs_calibration(self, module: torch.nn.Module) -> bool:
+        """Whether q has its own scheme that needs calibration."""
+        q_args = getattr(module, "_q_quantization_args", None)
+        return q_args is not None and q_args.dynamic in (False, DynamicType.LOCAL)
+
     def _initialize_observers(self, module: torch.nn.Module):
         if not hasattr(module, "quantization_scheme"):
             return
@@ -438,11 +487,15 @@ class QuantizationMixin(HooksMixin):
             if not is_attention:
                 initialize_observer(module, base_name="input")
             else:
-                if hasattr(module, IMPL_ATTR):
+                if hasattr(module, IMPL_ATTR) and not self._q_needs_calibration(module):
                     initialize_observer(module, base_name="q")
                 if hasattr(module, KV_CACHE_ATTR):
                     initialize_observer(module, base_name="k")
                     initialize_observer(module, base_name="v")
+
+        # q with its own scheme (independent of kv_cache_scheme's input_activations)
+        if is_attention and self._q_needs_calibration(module):
+            initialize_observer(module, base_name="q")
 
         # weight observers (used by `update_weight_zp_scale` or child modifier)
         if weight:
@@ -472,11 +525,15 @@ class QuantizationMixin(HooksMixin):
                     self.register_hook(module, calibrate_input_hook, "forward_pre")
                 )
             else:
-                if hasattr(module, IMPL_ATTR):
+                if hasattr(module, IMPL_ATTR) and not self._q_needs_calibration(module):
                     hooks.add(self.register_hook(module, calibrate_query_hook, "query"))
                 if hasattr(module, KV_CACHE_ATTR):
                     hooks.add(self.register_hook(module, calibrate_key_hook, "key"))
                     hooks.add(self.register_hook(module, calibrate_value_hook, "value"))
+
+        # q with its own scheme
+        if is_attention and self._q_needs_calibration(module):
+            hooks.add(self.register_hook(module, calibrate_query_hook, "query"))
 
         # output activations
         if output:
